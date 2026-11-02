@@ -8,11 +8,19 @@ android {
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.flipdeck.app"
+        applicationId = "com.flipdeck.home"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1"
+        versionCode = 2
+        versionName = "0.2"
+    }
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file("flipdeck.keystore")
+            storePassword = "flipdeck123"
+            keyAlias = "flipdeck"
+            keyPassword = "flipdeck123"
+        }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

@@ -4,6 +4,7 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.content.ActivityNotFoundException
 import android.content.BroadcastReceiver
+import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -16,10 +17,15 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
+import android.media.AudioManager
 import android.net.Uri
+import android.net.wifi.WifiManager
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
+import android.provider.MediaStore
 import android.provider.Settings
 import android.telephony.SignalStrength
 import android.telephony.TelephonyCallback
@@ -64,8 +70,10 @@ class Row(
 
 class Tile(val emoji: String, val label: String, val color: Int, val action: () -> Unit)
 
-enum class Screen { HOME, LIST, TEXT }
-enum class ListMode { APPS, SETTINGS }
+class ActionOpt(val id: String, val label: String)
+
+enum class Screen { HOME, LIST, TEXT, PHOTO }
+enum class ListMode { APPS, SETTINGS, QUICK }
 enum class TextMode { KEYTEST, INFO }
 
 class MainActivity : AppCompatActivity() {
@@ -74,6 +82,11 @@ class MainActivity : AppCompatActivity() {
     private val WC = ViewGroup.LayoutParams.WRAP_CONTENT
     private val REQ_PHONE = 11
     private val REQ_CALL = 12
+    private val REQ_PHOTOS = 13
+
+    // Real key codes on the IRIS Easy Flip 2 (found with the key tester)
+    private val KEY_FAVORITE = 318
+    private val KEY_SIDE = 317
 
     private lateinit var prefs: SharedPreferences
     private lateinit var wallpaperView: ImageView
@@ -81,9 +94,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var homeLayer: LinearLayout
     private lateinit var listLayer: LinearLayout
     private lateinit var textLayer: LinearLayout
+    private lateinit var photoLayer: LinearLayout
+    private lateinit var photoView: ImageView
+    private lateinit var photoInfo: TextView
     private lateinit var batteryText: TextView
     private lateinit var signalText: TextView
     private lateinit var dialText: TextView
+    private lateinit var leftHint: TextView
+    private lateinit var rightHint: TextView
     private lateinit var listTitle: TextView
     private lateinit var listHint: TextView
     private lateinit var infoText: TextView
@@ -103,6 +121,10 @@ class MainActivity : AppCompatActivity() {
     private var backCount = 0
     private var pendingCall: String? = null
     private var telCallback: Any? = null
+    private var torchOn = false
+    private val photoUris = mutableListOf<Uri>()
+    private var photoIdx = 0
+    private var photoToken = 0
 
     private val pickDoc = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) importWallpaper(uri)
@@ -119,6 +141,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun match() = FrameLayout.LayoutParams(MP, MP)
+    private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
 
     // ---------- lifecycle ----------
 
@@ -138,15 +161,21 @@ class MainActivity : AppCompatActivity() {
         buildHome()
         buildList()
         buildText()
+        buildPhoto()
         root.addView(homeLayer, match())
         root.addView(listLayer, match())
         root.addView(textLayer, match())
+        root.addView(photoLayer, match())
         setContentView(root)
 
         loadWallpaper()
         applyDim()
         updateSignal()
         showHome()
+
+        // "Set as wallpaper" from the Photos app
+        val d = intent?.data
+        if (intent?.action == Intent.ACTION_ATTACH_DATA && d != null) importWallpaper(d)
 
         if (checkSelfPermission(Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED) {
             startSignal()
@@ -184,10 +213,17 @@ class MainActivity : AppCompatActivity() {
             val keep = rows.getOrNull(selected)?.key
             refreshApps(keep)
         }
+        if (screen == Screen.LIST && listMode == ListMode.QUICK) refreshQuick()
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        val d = intent.data
+        if (intent.action == Intent.ACTION_ATTACH_DATA && d != null) {
+            importWallpaper(d)
+            showHome()
+            return
+        }
         // Pressing the Home key while we're running brings us back to the home page.
         if (intent.hasCategory(Intent.CATEGORY_HOME)) showHome()
     }
@@ -202,6 +238,9 @@ class MainActivity : AppCompatActivity() {
             val n = pendingCall
             pendingCall = null
             if (n != null) startCall(n, granted)
+        }
+        if (requestCode == REQ_PHOTOS) {
+            if (granted) loadPhotos() else toast("Photo permission needed")
         }
     }
 
@@ -287,12 +326,12 @@ class MainActivity : AppCompatActivity() {
         }
         homeLayer.addView(tileRow, LinearLayout.LayoutParams(MP, WC))
 
-        // soft key labels
+        // labels for the Favorites key and the side button
         val hints = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val left = shadowText(12f).apply { text = "Menu" }
-        val right = shadowText(12f).apply { text = "Contacts"; gravity = Gravity.END }
-        hints.addView(left, LinearLayout.LayoutParams(0, WC, 1f))
-        hints.addView(right, LinearLayout.LayoutParams(0, WC, 1f))
+        leftHint = shadowText(12f)
+        rightHint = shadowText(12f).apply { gravity = Gravity.END }
+        hints.addView(leftHint, LinearLayout.LayoutParams(0, WC, 1f))
+        hints.addView(rightHint, LinearLayout.LayoutParams(0, WC, 1f))
         homeLayer.addView(hints, LinearLayout.LayoutParams(MP, WC).apply { topMargin = dp(6) })
 
         updateTiles()
@@ -339,6 +378,22 @@ class MainActivity : AppCompatActivity() {
         textLayer.addView(infoText, LinearLayout.LayoutParams(MP, WC))
     }
 
+    private fun buildPhoto() {
+        photoLayer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.BLACK)
+        }
+        photoView = ImageView(this).apply { scaleType = ImageView.ScaleType.FIT_CENTER }
+        photoInfo = TextView(this).apply {
+            textSize = 12f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            setPadding(0, dp(4), 0, dp(4))
+        }
+        photoLayer.addView(photoView, LinearLayout.LayoutParams(MP, 0, 1f))
+        photoLayer.addView(photoInfo, LinearLayout.LayoutParams(MP, WC))
+    }
+
     // ---------- switching screens ----------
 
     private fun setScreen(s: Screen) {
@@ -346,12 +401,14 @@ class MainActivity : AppCompatActivity() {
         homeLayer.visibility = if (s == Screen.HOME) View.VISIBLE else View.GONE
         listLayer.visibility = if (s == Screen.LIST) View.VISIBLE else View.GONE
         textLayer.visibility = if (s == Screen.TEXT) View.VISIBLE else View.GONE
+        photoLayer.visibility = if (s == Screen.PHOTO) View.VISIBLE else View.GONE
     }
 
     private fun showHome() {
         setScreen(Screen.HOME)
         updateTiles()
         updateDialText()
+        updateHints()
     }
 
     private fun showApps() {
@@ -369,6 +426,15 @@ class MainActivity : AppCompatActivity() {
         selected = 0
         listTitle.text = "FlipDeck settings"
         listHint.text = "OK select   \u25C0 \u25B6 change   Back return"
+        showListScreen()
+    }
+
+    private fun showQuick() {
+        listMode = ListMode.QUICK
+        rows = buildQuickRows()
+        selected = 0
+        listTitle.text = "Quick settings"
+        listHint.text = "OK toggle   \u25C0 \u25B6 adjust   Back home"
         showListScreen()
     }
 
@@ -420,6 +486,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun updateHints() {
+        leftHint.text = "\u2605 " + labelFor(prefs.getString("fav", "contacts") ?: "contacts")
+        rightHint.text = labelFor(prefs.getString("side", "quick") ?: "quick") + " \u25CF"
+    }
+
     private fun updateBattery(i: Intent) {
         val level = i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
         val scale = i.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
@@ -468,7 +539,7 @@ class MainActivity : AppCompatActivity() {
             i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             startActivity(i)
         } catch (e: Exception) {
-            Toast.makeText(this, "Can't open that", Toast.LENGTH_SHORT).show()
+            toast("Can't open that")
         }
     }
 
@@ -499,15 +570,171 @@ class MainActivity : AppCompatActivity() {
         updateDialText()
     }
 
-    @SuppressLint("PrivateApi")
-    private fun openQuickPanel() {
-        try {
-            val sbs = getSystemService("statusbar")
-            val cls = Class.forName("android.app.StatusBarManager")
-            cls.getMethod("expandSettingsPanel").invoke(sbs)
-        } catch (e: Exception) {
-            Toast.makeText(this, "Control panel can't open from here yet", Toast.LENGTH_SHORT).show()
+    // ---------- key shortcuts (Favorites key + side button) ----------
+
+    private fun actionOptions(): List<ActionOpt> {
+        val list = mutableListOf(
+            ActionOpt("contacts", "Contacts"),
+            ActionOpt("messages", "Messages"),
+            ActionOpt("phone", "Phone"),
+            ActionOpt("apps", "All apps"),
+            ActionOpt("quick", "Quick settings"),
+            ActionOpt("torch", "Flashlight"),
+            ActionOpt("camera", "Camera")
+        )
+        val q = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        packageManager.queryIntentActivities(q, 0)
+            .filter { it.activityInfo.packageName != packageName }
+            .sortedBy { it.loadLabel(packageManager).toString().lowercase() }
+            .forEach {
+                list.add(ActionOpt("app:" + it.activityInfo.packageName, it.loadLabel(packageManager).toString()))
+            }
+        return list
+    }
+
+    private fun labelFor(id: String): String =
+        actionOptions().firstOrNull { it.id == id }?.label ?: id
+
+    private fun runAction(id: String) {
+        when {
+            id == "contacts" -> openContacts()
+            id == "messages" -> openMessages()
+            id == "phone" -> openDialer()
+            id == "apps" -> showApps()
+            id == "quick" -> showQuick()
+            id == "torch" -> toggleTorch()
+            id == "camera" -> safeStart(Intent(MediaStore.ACTION_IMAGE_CAPTURE))
+            id.startsWith("app:") -> {
+                val i = packageManager.getLaunchIntentForPackage(id.removePrefix("app:"))
+                if (i != null) safeStart(i) else toast("App not found")
+            }
         }
+    }
+
+    private fun cycleAction(prefKey: String, default: String, dir: Int) {
+        val opts = actionOptions()
+        val cur = prefs.getString(prefKey, default)
+        var i = opts.indexOfFirst { it.id == cur }
+        if (i < 0) i = 0
+        val next = opts[((i + dir) % opts.size + opts.size) % opts.size]
+        prefs.edit().putString(prefKey, next.id).apply()
+        refreshSettings()
+        updateHints()
+    }
+
+    // ---------- quick settings ----------
+
+    private fun toggleTorch() {
+        try {
+            val cm = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val id = cm.cameraIdList.firstOrNull {
+                cm.getCameraCharacteristics(it).get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+            }
+            if (id == null) {
+                toast("No flashlight found")
+                return
+            }
+            torchOn = !torchOn
+            cm.setTorchMode(id, torchOn)
+        } catch (e: Exception) {
+            torchOn = false
+            toast("Flashlight blocked: " + e.javaClass.simpleName)
+        }
+        refreshQuick()
+    }
+
+    private fun cycleRinger(dir: Int) {
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val order = intArrayOf(
+            AudioManager.RINGER_MODE_NORMAL, AudioManager.RINGER_MODE_VIBRATE, AudioManager.RINGER_MODE_SILENT
+        )
+        var i = order.indexOf(am.ringerMode)
+        if (i < 0) i = 0
+        val next = order[(i + dir + order.size) % order.size]
+        try {
+            am.ringerMode = next
+        } catch (e: Exception) {
+            toast("Silent needs Do Not Disturb access")
+        }
+        refreshQuick()
+    }
+
+    private fun changeVolume(stream: Int, d: Int) {
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val v = (am.getStreamVolume(stream) + d).coerceIn(0, am.getStreamMaxVolume(stream))
+        try {
+            am.setStreamVolume(stream, v, 0)
+        } catch (e: Exception) {
+            toast("Not allowed")
+        }
+        refreshQuick()
+    }
+
+    private fun buildQuickRows(): List<Row> {
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val off = Color.parseColor("#4B4B5A")
+
+        val modeName: String
+        val modeEmoji: String
+        val modeColor: Int
+        when (am.ringerMode) {
+            AudioManager.RINGER_MODE_NORMAL -> {
+                modeName = "Sound"; modeEmoji = "\uD83D\uDD14"; modeColor = Color.parseColor("#4CAF50")
+            }
+            AudioManager.RINGER_MODE_VIBRATE -> {
+                modeName = "Vibrate"; modeEmoji = "\uD83D\uDCF3"; modeColor = Color.parseColor("#FF9800")
+            }
+            else -> {
+                modeName = "Silent"; modeEmoji = "\uD83D\uDD15"; modeColor = Color.parseColor("#F44336")
+            }
+        }
+
+        val wifiOn = try {
+            (applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager).isWifiEnabled
+        } catch (e: Exception) {
+            false
+        }
+        val airplane = try {
+            Settings.Global.getInt(contentResolver, Settings.Global.AIRPLANE_MODE_ON, 0) == 1
+        } catch (e: Exception) {
+            false
+        }
+        val ringV = am.getStreamVolume(AudioManager.STREAM_RING)
+        val ringM = am.getStreamMaxVolume(AudioManager.STREAM_RING)
+        val mediaV = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+        val mediaM = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+
+        return listOf(
+            Row("Flashlight: " + (if (torchOn) "ON" else "OFF"),
+                if (torchOn) Color.parseColor("#FFC107") else off, emoji = "\uD83D\uDD26",
+                onOpen = { toggleTorch() }),
+            Row("Sound mode: $modeName", modeColor, emoji = modeEmoji,
+                onOpen = { cycleRinger(1) }, onLeft = { cycleRinger(-1) }, onRight = { cycleRinger(1) }),
+            Row("Ring volume: $ringV/$ringM", Color.parseColor("#2196F3"), emoji = "\uD83D\uDD0A",
+                onLeft = { changeVolume(AudioManager.STREAM_RING, -1) },
+                onRight = { changeVolume(AudioManager.STREAM_RING, 1) },
+                onOpen = { changeVolume(AudioManager.STREAM_RING, 1) }),
+            Row("Media volume: $mediaV/$mediaM", Color.parseColor("#9C27B0"), emoji = "\uD83C\uDFB5",
+                onLeft = { changeVolume(AudioManager.STREAM_MUSIC, -1) },
+                onRight = { changeVolume(AudioManager.STREAM_MUSIC, 1) },
+                onOpen = { changeVolume(AudioManager.STREAM_MUSIC, 1) }),
+            Row("Wi-Fi: " + (if (wifiOn) "ON" else "OFF") + " (OK)",
+                if (wifiOn) Color.parseColor("#03A9F4") else off, emoji = "\uD83D\uDCF6",
+                onOpen = { safeStart(Intent(Settings.ACTION_WIFI_SETTINGS)) }),
+            Row("Bluetooth (OK)", Color.parseColor("#3F51B5"), emoji = "\uD83D\uDD35",
+                onOpen = { safeStart(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)) }),
+            Row("Airplane: " + (if (airplane) "ON" else "OFF") + " (OK)",
+                if (airplane) Color.parseColor("#FF5722") else off, emoji = "\u2708\uFE0F",
+                onOpen = { safeStart(Intent(Settings.ACTION_AIRPLANE_MODE_SETTINGS)) })
+        )
+    }
+
+    private fun refreshQuick() {
+        if (!(screen == Screen.LIST && listMode == ListMode.QUICK)) return
+        val keep = selected
+        rows = buildQuickRows()
+        selected = keep
+        adapter.notifyDataSetChanged()
     }
 
     // ---------- apps list ----------
@@ -599,13 +826,25 @@ class MainActivity : AppCompatActivity() {
 
     private fun buildSettingRows(): List<Row> {
         val dim = prefs.getInt("dim", 40)
+        val favLabel = labelFor(prefs.getString("fav", "contacts") ?: "contacts")
+        val sideLabel = labelFor(prefs.getString("side", "quick") ?: "quick")
         return listOf(
-            Row("Choose wallpaper", Color.parseColor("#E91E63"), emoji = "\uD83D\uDDBC\uFE0F",
+            Row("Wallpaper from photos", Color.parseColor("#E91E63"), emoji = "\uD83D\uDDBC\uFE0F",
+                onOpen = { openPhotoBrowser() }),
+            Row("Wallpaper from files", Color.parseColor("#AB47BC"), emoji = "\uD83D\uDCC1",
                 onOpen = { pickWallpaper() }),
             Row("Wallpaper dimming: $dim%", Color.parseColor("#7C4DFF"), emoji = "\uD83C\uDF17",
                 onOpen = { cycleDim() }, onLeft = { changeDim(-10) }, onRight = { changeDim(10) }),
             Row("Default wallpaper", Color.parseColor("#FF9800"), emoji = "\uD83C\uDFA8",
                 onOpen = { resetWallpaper() }),
+            Row("Fav key: $favLabel", Color.parseColor("#FFB300"), emoji = "\u2B50",
+                onOpen = { cycleAction("fav", "contacts", 1) },
+                onLeft = { cycleAction("fav", "contacts", -1) },
+                onRight = { cycleAction("fav", "contacts", 1) }),
+            Row("Side key: $sideLabel", Color.parseColor("#26C6DA"), emoji = "\uD83D\uDD18",
+                onOpen = { cycleAction("side", "quick", 1) },
+                onLeft = { cycleAction("side", "quick", -1) },
+                onRight = { cycleAction("side", "quick", 1) }),
             Row("Key tester", Color.parseColor("#00BFA5"), emoji = "\u2328\uFE0F",
                 onOpen = { showKeyTester() }),
             Row("Phone check", Color.parseColor("#2196F3"), emoji = "\uD83E\uDE7A",
@@ -617,14 +856,19 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    private fun changeDim(delta: Int) {
-        val d = (prefs.getInt("dim", 40) + delta).coerceIn(0, 80)
-        prefs.edit().putInt("dim", d).apply()
-        applyDim()
+    private fun refreshSettings() {
+        if (!(screen == Screen.LIST && listMode == ListMode.SETTINGS)) return
         val keep = selected
         rows = buildSettingRows()
         selected = keep
         adapter.notifyDataSetChanged()
+    }
+
+    private fun changeDim(delta: Int) {
+        val d = (prefs.getInt("dim", 40) + delta).coerceIn(0, 80)
+        prefs.edit().putInt("dim", d).apply()
+        applyDim()
+        refreshSettings()
     }
 
     private fun cycleDim() {
@@ -642,7 +886,7 @@ class MainActivity : AppCompatActivity() {
         val other = packageManager.queryIntentActivities(home, 0)
             .firstOrNull { it.activityInfo.packageName != packageName }
         if (other == null) {
-            Toast.makeText(this, "Original home screen not found", Toast.LENGTH_SHORT).show()
+            toast("Original home screen not found")
             return
         }
         safeStart(
@@ -664,39 +908,41 @@ class MainActivity : AppCompatActivity() {
             try {
                 pickContent.launch("image/*")
             } catch (e2: Exception) {
-                Toast.makeText(this, "No photo picker found on this phone", Toast.LENGTH_LONG).show()
+                Toast.makeText(this, "No file picker found on this phone", Toast.LENGTH_LONG).show()
             }
+        }
+    }
+
+    private fun decodeSampled(uri: Uri, maxSide: Int): Bitmap? {
+        return try {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+            var sample = 1
+            while (bounds.outWidth / sample > maxSide || bounds.outHeight / sample > maxSide) sample *= 2
+            val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+            contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
+        } catch (e: Exception) {
+            null
         }
     }
 
     private fun importWallpaper(uri: Uri) {
         Thread {
-            try {
-                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
-                var sample = 1
-                while (bounds.outWidth / sample > 2160 || bounds.outHeight / sample > 2160) sample *= 2
-                val opts = BitmapFactory.Options().apply { inSampleSize = sample }
-                val bmp = contentResolver.openInputStream(uri)?.use {
-                    BitmapFactory.decodeStream(it, null, opts)
-                }
-                if (bmp != null) {
+            val bmp = decodeSampled(uri, 2160)
+            if (bmp != null) {
+                try {
                     File(filesDir, "wallpaper.jpg").outputStream().use {
                         bmp.compress(Bitmap.CompressFormat.JPEG, 90, it)
                     }
                     runOnUiThread {
                         loadWallpaper()
-                        Toast.makeText(this, "Wallpaper set", Toast.LENGTH_SHORT).show()
+                        toast("Wallpaper set")
                     }
-                } else {
-                    runOnUiThread {
-                        Toast.makeText(this, "Couldn't read that picture", Toast.LENGTH_SHORT).show()
-                    }
+                } catch (e: Exception) {
+                    runOnUiThread { toast("Couldn't save the picture") }
                 }
-            } catch (e: Exception) {
-                runOnUiThread {
-                    Toast.makeText(this, "Couldn't read that picture", Toast.LENGTH_SHORT).show()
-                }
+            } else {
+                runOnUiThread { toast("Couldn't read that picture") }
             }
         }.start()
     }
@@ -723,7 +969,83 @@ class MainActivity : AppCompatActivity() {
     private fun resetWallpaper() {
         File(filesDir, "wallpaper.jpg").delete()
         loadWallpaper()
-        Toast.makeText(this, "Default wallpaper", Toast.LENGTH_SHORT).show()
+        toast("Default wallpaper")
+    }
+
+    // ---------- photo browser (pick a wallpaper with the arrow keys) ----------
+
+    private fun openPhotoBrowser() {
+        val perm = if (Build.VERSION.SDK_INT >= 33)
+            Manifest.permission.READ_MEDIA_IMAGES else Manifest.permission.READ_EXTERNAL_STORAGE
+        if (checkSelfPermission(perm) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(perm), REQ_PHOTOS)
+        } else {
+            loadPhotos()
+        }
+    }
+
+    private fun loadPhotos() {
+        photoUris.clear()
+        try {
+            val base = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+            contentResolver.query(
+                base, arrayOf(MediaStore.Images.Media._ID), null, null,
+                MediaStore.Images.Media.DATE_ADDED + " DESC"
+            )?.use { c ->
+                val idCol = c.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+                while (c.moveToNext() && photoUris.size < 300) {
+                    photoUris.add(ContentUris.withAppendedId(base, c.getLong(idCol)))
+                }
+            }
+        } catch (e: Exception) {
+            toast("Can't read photos")
+            return
+        }
+        if (photoUris.isEmpty()) {
+            toast("No photos found")
+        } else {
+            photoIdx = 0
+            showPhoto()
+        }
+    }
+
+    private fun showPhoto() {
+        setScreen(Screen.PHOTO)
+        photoInfo.text = (photoIdx + 1).toString() + " / " + photoUris.size +
+                "    \u25C0 \u25B6 browse   OK set   Back cancel"
+        val uri = photoUris[photoIdx]
+        val token = ++photoToken
+        Thread {
+            val bmp = decodeSampled(uri, 720)
+            runOnUiThread {
+                if (token == photoToken && bmp != null) photoView.setImageBitmap(bmp)
+            }
+        }.start()
+    }
+
+    private fun photoKey(k: Int): Boolean {
+        when (k) {
+            KeyEvent.KEYCODE_DPAD_LEFT -> {
+                photoIdx = (photoIdx + photoUris.size - 1) % photoUris.size
+                showPhoto()
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                photoIdx = (photoIdx + 1) % photoUris.size
+                showPhoto()
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
+                importWallpaper(photoUris[photoIdx])
+                showHome()
+                return true
+            }
+            KeyEvent.KEYCODE_BACK -> {
+                showSettings()
+                return true
+            }
+        }
+        return false
     }
 
     // ---------- phone check ----------
@@ -735,7 +1057,6 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {
             "NOT FOUND"
         }
-        val panel = if (getSystemService("statusbar") != null) "yes" else "no"
         return "PHONE CHECK\n\n" +
                 "Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")\n" +
                 "Model: " + Build.MODEL + "\n" +
@@ -743,18 +1064,27 @@ class MainActivity : AppCompatActivity() {
                 "Flashlight: " + pm.hasSystemFeature(PackageManager.FEATURE_CAMERA_FLASH) + "\n" +
                 "Telephony: " + pm.hasSystemFeature(PackageManager.FEATURE_TELEPHONY) + "\n" +
                 "Wi-Fi: " + pm.hasSystemFeature(PackageManager.FEATURE_WIFI) + "\n" +
-                "Bluetooth: " + pm.hasSystemFeature(PackageManager.FEATURE_BLUETOOTH) + "\n" +
-                "Status bar service: " + panel + "\n\n" +
+                "Bluetooth: " + pm.hasSystemFeature(PackageManager.FEATURE_BLUETOOTH) + "\n\n" +
                 "Back = return"
     }
 
     // ---------- keys ----------
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        val testing = screen == Screen.TEXT && textMode == TextMode.KEYTEST
+        if (!testing && (keyCode == KEY_FAVORITE || keyCode == KEY_SIDE)) {
+            if (event == null || event.repeatCount == 0) {
+                val id = if (keyCode == KEY_FAVORITE)
+                    prefs.getString("fav", "contacts") else prefs.getString("side", "quick")
+                runAction(id ?: "apps")
+            }
+            return true
+        }
         val handled = when (screen) {
             Screen.HOME -> homeKey(keyCode)
             Screen.LIST -> listKey(keyCode)
             Screen.TEXT -> textKey(keyCode)
+            Screen.PHOTO -> photoKey(keyCode)
         }
         return handled || super.onKeyDown(keyCode, event)
     }
@@ -784,7 +1114,7 @@ class MainActivity : AppCompatActivity() {
                 return true
             }
             KeyEvent.KEYCODE_DPAD_UP -> {
-                openQuickPanel()
+                showQuick()
                 return true
             }
             KeyEvent.KEYCODE_DPAD_DOWN -> {
@@ -799,12 +1129,8 @@ class MainActivity : AppCompatActivity() {
                 if (dial.isNotEmpty()) placeCall() else openDialer()
                 return true
             }
-            KeyEvent.KEYCODE_SOFT_LEFT, KeyEvent.KEYCODE_MENU -> {
+            KeyEvent.KEYCODE_MENU -> {
                 showApps()
-                return true
-            }
-            KeyEvent.KEYCODE_SOFT_RIGHT -> {
-                openContacts()
                 return true
             }
             KeyEvent.KEYCODE_DEL, KeyEvent.KEYCODE_CLEAR -> {
@@ -833,14 +1159,19 @@ class MainActivity : AppCompatActivity() {
     private fun listKey(k: Int): Boolean {
         when (k) {
             KeyEvent.KEYCODE_DPAD_UP -> { select(selected - 1); return true }
-            KeyEvent.KEYCODE_DPAD_DOWN -> { select(selected + 1); return true }
+            KeyEvent.KEYCODE_DPAD_DOWN -> {
+                // In quick settings, pressing Down on the last item goes back home
+                if (listMode == ListMode.QUICK && selected == rows.size - 1) showHome()
+                else select(selected + 1)
+                return true
+            }
             KeyEvent.KEYCODE_DPAD_LEFT -> { rows.getOrNull(selected)?.onLeft?.invoke(); return true }
             KeyEvent.KEYCODE_DPAD_RIGHT -> { rows.getOrNull(selected)?.onRight?.invoke(); return true }
-            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_SOFT_LEFT -> {
+            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
                 rows.getOrNull(selected)?.onOpen?.invoke()
                 return true
             }
-            KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_SOFT_RIGHT -> {
+            KeyEvent.KEYCODE_BACK -> {
                 if (listMode == ListMode.SETTINGS) showApps() else showHome()
                 return true
             }
@@ -869,7 +1200,7 @@ class MainActivity : AppCompatActivity() {
             if (backCount >= 2) showSettings()
             return true
         }
-        if (k == KeyEvent.KEYCODE_BACK || k == KeyEvent.KEYCODE_SOFT_RIGHT) {
+        if (k == KeyEvent.KEYCODE_BACK) {
             showSettings()
             return true
         }
@@ -893,7 +1224,7 @@ class MainActivity : AppCompatActivity() {
             ): Int = (boxStart + (boxEnd - boxStart) / 2) - (viewStart + (viewEnd - viewStart) / 2)
 
             override fun calculateSpeedPerPixel(displayMetrics: DisplayMetrics): Float =
-                90f / displayMetrics.densityDpi
+                70f / displayMetrics.densityDpi
         }
         scroller.targetPosition = target
         list.layoutManager?.startSmoothScroll(scroller)

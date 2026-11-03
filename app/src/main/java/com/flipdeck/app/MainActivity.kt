@@ -2,6 +2,7 @@ package com.flipdeck.app
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.RoleManager
 import android.content.ActivityNotFoundException
 import android.content.BroadcastReceiver
 import android.content.ContentUris
@@ -1030,6 +1031,8 @@ class MainActivity : AppCompatActivity() {
         val keyState = if (readKey() != null) "set" else "not set"
         val model = prefs.getString("openai_model", aiModels[0]) ?: aiModels[0]
         return listOf(
+            Row("Make FlipDeck my home screen", Color.parseColor("#7C4DFF"), emoji = "\uD83C\uDFE0",
+                onOpen = { requestHomeRole() }),
             Row("Wallpaper from photos", Color.parseColor("#E91E63"), emoji = "\uD83D\uDDBC\uFE0F",
                 onOpen = { openPhotoBrowser() }),
             Row("Wallpaper from files", Color.parseColor("#AB47BC"), emoji = "\uD83D\uDCC1",
@@ -1093,6 +1096,26 @@ class MainActivity : AppCompatActivity() {
     private fun applyDim() {
         val d = prefs.getInt("dim", 40)
         dimView.setBackgroundColor(Color.argb(d * 255 / 100, 0, 0, 0))
+    }
+
+    // Asks Android "make FlipDeck your home screen?" You answer Yes or No in a pop-up.
+    private fun requestHomeRole() {
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                val rm = getSystemService(RoleManager::class.java)
+                if (rm != null && rm.isRoleAvailable(RoleManager.ROLE_HOME)) {
+                    if (rm.isRoleHeld(RoleManager.ROLE_HOME)) {
+                        toast("FlipDeck is already your home screen")
+                    } else {
+                        startActivityForResult(rm.createRequestRoleIntent(RoleManager.ROLE_HOME), 77)
+                    }
+                    return
+                }
+            }
+            toastLong("Press the power key and choose FlipDeck")
+        } catch (e: Exception) {
+            toastLong("Press the power key and choose FlipDeck")
+        }
     }
 
     private fun openOriginalHome() {

@@ -25,12 +25,16 @@ import android.net.wifi.WifiManager
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.provider.Settings
 import android.telephony.SignalStrength
 import android.telephony.TelephonyCallback
 import android.telephony.TelephonyManager
 import android.text.SpannableString
+import android.text.SpannableStringBuilder
 import android.text.Spanned
 import android.text.TextUtils
 import android.text.style.ForegroundColorSpan
@@ -38,12 +42,16 @@ import android.text.style.RelativeSizeSpan
 import android.util.DisplayMetrics
 import android.view.Gravity
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.WebChromeClient
 import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextClock
 import android.widget.TextView
 import android.widget.Toast
@@ -52,7 +60,11 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.LinearSmoothScroller
 import androidx.recyclerview.widget.RecyclerView
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
 
 // ---------- small data classes ----------
 
@@ -72,9 +84,90 @@ class Tile(val emoji: String, val label: String, val color: Int, val action: () 
 
 class ActionOpt(val id: String, val label: String)
 
-enum class Screen { HOME, LIST, TEXT, PHOTO }
-enum class ListMode { APPS, SETTINGS, QUICK }
+enum class Screen { HOME, LIST, TEXT, PHOTO, INPUT, WEB }
+enum class ListMode { APPS, SETTINGS, QUICK, BROWSER }
 enum class TextMode { KEYTEST, INFO }
+enum class InputMode { CHAT, KEY, URL }
+
+// Types text with the number keys, like old phones: press 2 once = a, twice = b, three times = c.
+class MultiTap {
+    val sb = StringBuilder()
+    var caseMode = 0 // 0 = Abc (capital at start of a sentence), 1 = abc, 2 = ABC
+    private var lastKey = -1
+    private var lastTime = 0L
+    private var idx = 0
+
+    private val map = mapOf(
+        KeyEvent.KEYCODE_1 to ".,?!'-1",
+        KeyEvent.KEYCODE_2 to "abc2",
+        KeyEvent.KEYCODE_3 to "def3",
+        KeyEvent.KEYCODE_4 to "ghi4",
+        KeyEvent.KEYCODE_5 to "jkl5",
+        KeyEvent.KEYCODE_6 to "mno6",
+        KeyEvent.KEYCODE_7 to "pqrs7",
+        KeyEvent.KEYCODE_8 to "tuv8",
+        KeyEvent.KEYCODE_9 to "wxyz9",
+        KeyEvent.KEYCODE_0 to " 0",
+        KeyEvent.KEYCODE_POUND to "/:@_&()=+%\$#"
+    )
+
+    fun key(k: Int): Boolean {
+        val chars = map[k] ?: return false
+        val now = System.currentTimeMillis()
+        val cycling = k == lastKey && now - lastTime < 900 && sb.isNotEmpty()
+        if (cycling) {
+            idx = (idx + 1) % chars.length
+            sb.setLength(sb.length - 1)
+        } else {
+            idx = 0
+        }
+        sb.append(cased(chars[idx]))
+        lastKey = k
+        lastTime = now
+        return true
+    }
+
+    private fun atStart(): Boolean {
+        val n = sb.length
+        if (n == 0) return true
+        if (n >= 2 && sb[n - 1] == ' ' && (sb[n - 2] == '.' || sb[n - 2] == '?' || sb[n - 2] == '!')) return true
+        return false
+    }
+
+    private fun cased(c: Char): Char {
+        if (!c.isLetter()) return c
+        return when (caseMode) {
+            1 -> c.lowercaseChar()
+            2 -> c.uppercaseChar()
+            else -> if (atStart()) c.uppercaseChar() else c.lowercaseChar()
+        }
+    }
+
+    fun star() {
+        caseMode = (caseMode + 1) % 3
+        lastKey = -1
+    }
+
+    fun caseLabel(): String = when (caseMode) {
+        0 -> "Abc"
+        1 -> "abc"
+        else -> "ABC"
+    }
+
+    fun backspace(): Boolean {
+        if (sb.isEmpty()) return false
+        sb.setLength(sb.length - 1)
+        lastKey = -1
+        return true
+    }
+
+    fun clear() {
+        sb.setLength(0)
+        lastKey = -1
+    }
+
+    fun text(): String = sb.toString()
+}
 
 class MainActivity : AppCompatActivity() {
 
@@ -88,13 +181,17 @@ class MainActivity : AppCompatActivity() {
     private val KEY_FAVORITE = 318
     private val KEY_SIDE = 317
 
+    private val aiModels = listOf("gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1")
+
     private lateinit var prefs: SharedPreferences
+    private lateinit var rootLayout: FrameLayout
     private lateinit var wallpaperView: ImageView
     private lateinit var dimView: View
     private lateinit var homeLayer: LinearLayout
     private lateinit var listLayer: LinearLayout
     private lateinit var textLayer: LinearLayout
     private lateinit var photoLayer: LinearLayout
+    private lateinit var inputLayer: LinearLayout
     private lateinit var photoView: ImageView
     private lateinit var photoInfo: TextView
     private lateinit var batteryText: TextView
@@ -105,10 +202,30 @@ class MainActivity : AppCompatActivity() {
     private lateinit var listTitle: TextView
     private lateinit var listHint: TextView
     private lateinit var infoText: TextView
+    private lateinit var inputTitle: TextView
+    private lateinit var convoScroll: ScrollView
+    private lateinit var convoText: TextView
+    private lateinit var inputBox: TextView
+    private lateinit var inputHint: TextView
     private lateinit var list: RecyclerView
     private lateinit var tileDefs: List<Tile>
     private val tileViews = mutableListOf<TextView>()
     private val adapter = RowAdapter()
+    private val ui = Handler(Looper.getMainLooper())
+
+    private var webLayer: FrameLayout? = null
+    private var webView: WebView? = null
+    private var cursorView: View? = null
+    private var cx = 0f
+    private var cy = 0f
+    private var scrollMode = false
+
+    private val mt = MultiTap()
+    private var inputMode = InputMode.CHAT
+    private val convo = SpannableStringBuilder()
+    private val history = mutableListOf<Pair<String, String>>()
+    private var busy = false
+    private var thinkingMark = -1
 
     private var rows: List<Row> = emptyList()
     private var selected = 0
@@ -142,6 +259,7 @@ class MainActivity : AppCompatActivity() {
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun match() = FrameLayout.LayoutParams(MP, MP)
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+    private fun toastLong(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()
 
     // ---------- lifecycle ----------
 
@@ -152,21 +270,23 @@ class MainActivity : AppCompatActivity() {
         window.navigationBarColor = Color.BLACK
         prefs = getSharedPreferences("flipdeck", MODE_PRIVATE)
 
-        val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        rootLayout = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
         wallpaperView = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
         dimView = View(this)
-        root.addView(wallpaperView, match())
-        root.addView(dimView, match())
+        rootLayout.addView(wallpaperView, match())
+        rootLayout.addView(dimView, match())
 
         buildHome()
         buildList()
         buildText()
         buildPhoto()
-        root.addView(homeLayer, match())
-        root.addView(listLayer, match())
-        root.addView(textLayer, match())
-        root.addView(photoLayer, match())
-        setContentView(root)
+        buildInput()
+        rootLayout.addView(homeLayer, match())
+        rootLayout.addView(listLayer, match())
+        rootLayout.addView(textLayer, match())
+        rootLayout.addView(photoLayer, match())
+        rootLayout.addView(inputLayer, match())
+        setContentView(rootLayout)
 
         loadWallpaper()
         applyDim()
@@ -195,6 +315,11 @@ class MainActivity : AppCompatActivity() {
         try { unregisterReceiver(batteryReceiver) } catch (e: Exception) { }
     }
 
+    override fun onPause() {
+        super.onPause()
+        webView?.onPause()
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -203,10 +328,12 @@ class MainActivity : AppCompatActivity() {
                 if (cb != null) getSystemService(TelephonyManager::class.java).unregisterTelephonyCallback(cb)
             } catch (e: Exception) { }
         }
+        webView?.destroy()
     }
 
     override fun onResume() {
         super.onResume()
+        webView?.onResume()
         dial.setLength(0)
         updateDialText()
         if (screen == Screen.LIST && listMode == ListMode.APPS) {
@@ -394,6 +521,45 @@ class MainActivity : AppCompatActivity() {
         photoLayer.addView(photoInfo, LinearLayout.LayoutParams(MP, WC))
     }
 
+    private fun buildInput() {
+        inputLayer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.argb(240, 8, 8, 14))
+            setPadding(dp(10), dp(8), dp(10), dp(6))
+        }
+        inputTitle = TextView(this).apply {
+            textSize = 16f
+            setTextColor(Color.WHITE)
+            typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+        }
+        convoText = TextView(this).apply {
+            textSize = 14f
+            setTextColor(Color.WHITE)
+        }
+        convoScroll = ScrollView(this).apply {
+            isFocusable = false
+            addView(convoText)
+        }
+        inputBox = TextView(this).apply {
+            textSize = 18f
+            setTextColor(Color.WHITE)
+            minHeight = dp(48)
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(12).toFloat()
+                setColor(Color.parseColor("#2A2A3A"))
+            }
+        }
+        inputHint = TextView(this).apply {
+            textSize = 11f
+            setTextColor(Color.parseColor("#9A9AAC"))
+        }
+        inputLayer.addView(inputTitle, LinearLayout.LayoutParams(MP, WC))
+        inputLayer.addView(convoScroll, LinearLayout.LayoutParams(MP, 0, 1f))
+        inputLayer.addView(inputBox, LinearLayout.LayoutParams(MP, WC).apply { topMargin = dp(6) })
+        inputLayer.addView(inputHint, LinearLayout.LayoutParams(MP, WC))
+    }
+
     // ---------- switching screens ----------
 
     private fun setScreen(s: Screen) {
@@ -402,6 +568,8 @@ class MainActivity : AppCompatActivity() {
         listLayer.visibility = if (s == Screen.LIST) View.VISIBLE else View.GONE
         textLayer.visibility = if (s == Screen.TEXT) View.VISIBLE else View.GONE
         photoLayer.visibility = if (s == Screen.PHOTO) View.VISIBLE else View.GONE
+        inputLayer.visibility = if (s == Screen.INPUT) View.VISIBLE else View.GONE
+        webLayer?.visibility = if (s == Screen.WEB) View.VISIBLE else View.GONE
     }
 
     private fun showHome() {
@@ -435,6 +603,15 @@ class MainActivity : AppCompatActivity() {
         selected = 0
         listTitle.text = "Quick settings"
         listHint.text = "OK toggle   \u25C0 \u25B6 adjust   Back home"
+        showListScreen()
+    }
+
+    private fun showBrowser() {
+        listMode = ListMode.BROWSER
+        rows = buildBrowserRows()
+        selected = 0
+        listTitle.text = "Browser"
+        listHint.text = "OK open   Back home"
         showListScreen()
     }
 
@@ -488,7 +665,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateHints() {
         leftHint.text = "\u2605 " + labelFor(prefs.getString("fav", "contacts") ?: "contacts")
-        rightHint.text = labelFor(prefs.getString("side", "quick") ?: "quick") + " \u25CF"
+        rightHint.text = labelFor(prefs.getString("side", "chat") ?: "chat") + " \u25CF"
     }
 
     private fun updateBattery(i: Intent) {
@@ -573,12 +750,14 @@ class MainActivity : AppCompatActivity() {
     // ---------- key shortcuts (Favorites key + side button) ----------
 
     private fun actionOptions(): List<ActionOpt> {
-        val list = mutableListOf(
+        val opts = mutableListOf(
             ActionOpt("contacts", "Contacts"),
             ActionOpt("messages", "Messages"),
             ActionOpt("phone", "Phone"),
             ActionOpt("apps", "All apps"),
             ActionOpt("quick", "Quick settings"),
+            ActionOpt("chat", "ChatGPT"),
+            ActionOpt("browser", "Browser"),
             ActionOpt("torch", "Flashlight"),
             ActionOpt("camera", "Camera")
         )
@@ -587,9 +766,9 @@ class MainActivity : AppCompatActivity() {
             .filter { it.activityInfo.packageName != packageName }
             .sortedBy { it.loadLabel(packageManager).toString().lowercase() }
             .forEach {
-                list.add(ActionOpt("app:" + it.activityInfo.packageName, it.loadLabel(packageManager).toString()))
+                opts.add(ActionOpt("app:" + it.activityInfo.packageName, it.loadLabel(packageManager).toString()))
             }
-        return list
+        return opts
     }
 
     private fun labelFor(id: String): String =
@@ -602,6 +781,8 @@ class MainActivity : AppCompatActivity() {
             id == "phone" -> openDialer()
             id == "apps" -> showApps()
             id == "quick" -> showQuick()
+            id == "chat" -> openChat()
+            id == "browser" -> showBrowser()
             id == "torch" -> toggleTorch()
             id == "camera" -> safeStart(Intent(MediaStore.ACTION_IMAGE_CAPTURE))
             id.startsWith("app:") -> {
@@ -725,7 +906,9 @@ class MainActivity : AppCompatActivity() {
                 onOpen = { safeStart(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)) }),
             Row("Airplane: " + (if (airplane) "ON" else "OFF") + " (OK)",
                 if (airplane) Color.parseColor("#FF5722") else off, emoji = "\u2708\uFE0F",
-                onOpen = { safeStart(Intent(Settings.ACTION_AIRPLANE_MODE_SETTINGS)) })
+                onOpen = { safeStart(Intent(Settings.ACTION_AIRPLANE_MODE_SETTINGS)) }),
+            Row("Silent access (OK)", Color.parseColor("#795548"), emoji = "\uD83D\uDD15",
+                onOpen = { safeStart(Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS)) })
         )
     }
 
@@ -783,14 +966,30 @@ class MainActivity : AppCompatActivity() {
             .sortedBy { it.loadLabel(packageManager).toString().lowercase() }
             .map { toRow(it) }
 
-        val settingsRow = Row(
-            title = "FlipDeck settings",
-            color = Color.parseColor("#455A64"),
-            emoji = "\u2699\uFE0F",
-            key = "__settings",
-            onOpen = { showSettings() }
+        val top = listOf(
+            Row(
+                title = "FlipDeck settings",
+                color = Color.parseColor("#455A64"),
+                emoji = "\u2699\uFE0F",
+                key = "__settings",
+                onOpen = { showSettings() }
+            ),
+            Row(
+                title = "ChatGPT",
+                color = Color.parseColor("#10A37F"),
+                emoji = "\uD83E\uDD16",
+                key = "__chat",
+                onOpen = { openChat() }
+            ),
+            Row(
+                title = "Browser",
+                color = Color.parseColor("#1A73E8"),
+                emoji = "\uD83C\uDF10",
+                key = "__browser",
+                onOpen = { showBrowser() }
+            )
         )
-        return listOf(settingsRow) + pinnedRows + restRows
+        return top + pinnedRows + restRows
     }
 
     private fun refreshApps(keepKey: String?) {
@@ -803,7 +1002,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun togglePin() {
         val key = rows.getOrNull(selected)?.key ?: return
-        if (key == "__settings") return
+        if (key.startsWith("__")) return
         val pins = getPins().toMutableList()
         if (key in pins) pins.remove(key) else pins.add(key)
         savePins(pins)
@@ -827,7 +1026,9 @@ class MainActivity : AppCompatActivity() {
     private fun buildSettingRows(): List<Row> {
         val dim = prefs.getInt("dim", 40)
         val favLabel = labelFor(prefs.getString("fav", "contacts") ?: "contacts")
-        val sideLabel = labelFor(prefs.getString("side", "quick") ?: "quick")
+        val sideLabel = labelFor(prefs.getString("side", "chat") ?: "chat")
+        val keyState = if (readKey() != null) "set" else "not set"
+        val model = prefs.getString("openai_model", aiModels[0]) ?: aiModels[0]
         return listOf(
             Row("Wallpaper from photos", Color.parseColor("#E91E63"), emoji = "\uD83D\uDDBC\uFE0F",
                 onOpen = { openPhotoBrowser() }),
@@ -842,9 +1043,13 @@ class MainActivity : AppCompatActivity() {
                 onLeft = { cycleAction("fav", "contacts", -1) },
                 onRight = { cycleAction("fav", "contacts", 1) }),
             Row("Side key: $sideLabel", Color.parseColor("#26C6DA"), emoji = "\uD83D\uDD18",
-                onOpen = { cycleAction("side", "quick", 1) },
-                onLeft = { cycleAction("side", "quick", -1) },
-                onRight = { cycleAction("side", "quick", 1) }),
+                onOpen = { cycleAction("side", "chat", 1) },
+                onLeft = { cycleAction("side", "chat", -1) },
+                onRight = { cycleAction("side", "chat", 1) }),
+            Row("ChatGPT key: $keyState", Color.parseColor("#10A37F"), emoji = "\uD83D\uDD11",
+                onOpen = { openEntry(InputMode.KEY) }),
+            Row("ChatGPT model: $model", Color.parseColor("#0E8A6B"), emoji = "\uD83E\uDDE0",
+                onOpen = { cycleModel(1) }, onLeft = { cycleModel(-1) }, onRight = { cycleModel(1) }),
             Row("Key tester", Color.parseColor("#00BFA5"), emoji = "\u2328\uFE0F",
                 onOpen = { showKeyTester() }),
             Row("Phone check", Color.parseColor("#2196F3"), emoji = "\uD83E\uDE7A",
@@ -862,6 +1067,15 @@ class MainActivity : AppCompatActivity() {
         rows = buildSettingRows()
         selected = keep
         adapter.notifyDataSetChanged()
+    }
+
+    private fun cycleModel(dir: Int) {
+        val cur = prefs.getString("openai_model", aiModels[0])
+        var i = aiModels.indexOf(cur)
+        if (i < 0) i = 0
+        val next = aiModels[((i + dir) % aiModels.size + aiModels.size) % aiModels.size]
+        prefs.edit().putString("openai_model", next).apply()
+        refreshSettings()
     }
 
     private fun changeDim(delta: Int) {
@@ -908,7 +1122,7 @@ class MainActivity : AppCompatActivity() {
             try {
                 pickContent.launch("image/*")
             } catch (e2: Exception) {
-                Toast.makeText(this, "No file picker found on this phone", Toast.LENGTH_LONG).show()
+                toastLong("No file picker found on this phone")
             }
         }
     }
@@ -1048,6 +1262,360 @@ class MainActivity : AppCompatActivity() {
         return false
     }
 
+    // ---------- typing screen (ChatGPT, API key, web address) ----------
+
+    private fun updateInput() {
+        inputBox.text = mt.text() + "\u258C"
+        inputHint.text = (if (inputMode == InputMode.CHAT) "OK send" else "OK done") +
+                "   Back delete   * " + mt.caseLabel() + "   0 space"
+    }
+
+    private fun openChat() {
+        inputMode = InputMode.CHAT
+        mt.caseMode = 0
+        inputTitle.text = "ChatGPT"
+        if (convo.isEmpty()) {
+            convo.append("Type with the number keys. Press a key again quickly for the next letter. OK sends. Up/Down scrolls.\n\n")
+        }
+        if (readKey() == null) toastLong("No API key yet. FlipDeck settings > ChatGPT key")
+        convoText.text = convo
+        updateInput()
+        setScreen(Screen.INPUT)
+        convoScroll.post { convoScroll.fullScroll(View.FOCUS_DOWN) }
+    }
+
+    private fun openEntry(mode: InputMode) {
+        inputMode = mode
+        mt.clear()
+        mt.caseMode = 1
+        when (mode) {
+            InputMode.KEY -> {
+                inputTitle.text = "ChatGPT key"
+                convoText.text = "Type your OpenAI API key, then press OK.\n\n* switches between abc / ABC / Abc.\n\nEasier: put it in a file on the phone. Phone check shows where."
+            }
+            InputMode.URL -> {
+                inputTitle.text = "Go to"
+                convoText.text = "Type a web address or words to search.\n\nStart with yt  to search YouTube.\n\nOK = go   Back = delete"
+            }
+            else -> { }
+        }
+        updateInput()
+        setScreen(Screen.INPUT)
+        convoScroll.post { convoScroll.fullScroll(View.FOCUS_UP) }
+    }
+
+    private fun leaveInput() {
+        when (inputMode) {
+            InputMode.CHAT -> showHome()
+            InputMode.KEY -> showSettings()
+            InputMode.URL -> if (webLayer != null) setScreen(Screen.WEB) else showBrowser()
+        }
+    }
+
+    private fun submitInput() {
+        val text = mt.text().trim()
+        when (inputMode) {
+            InputMode.CHAT -> {
+                if (text.isEmpty()) return
+                if (busy) {
+                    toast("Wait for the answer")
+                    return
+                }
+                addConvo("You", text, Color.parseColor("#4FC3F7"))
+                mt.clear()
+                updateInput()
+                askAI(text)
+            }
+            InputMode.KEY -> {
+                prefs.edit().putString("openai_key", text).apply()
+                toast("Key saved")
+                showSettings()
+            }
+            InputMode.URL -> {
+                if (text.isEmpty()) return
+                openUrl(parseAddress(text))
+            }
+        }
+    }
+
+    private fun inputKey(k: Int): Boolean {
+        when (k) {
+            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
+                submitInput()
+                return true
+            }
+            KeyEvent.KEYCODE_BACK -> {
+                if (!mt.backspace()) leaveInput()
+                updateInput()
+                return true
+            }
+            KeyEvent.KEYCODE_DEL, KeyEvent.KEYCODE_CLEAR -> {
+                mt.backspace()
+                updateInput()
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_UP -> {
+                convoScroll.smoothScrollBy(0, -dp(70))
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_DOWN -> {
+                convoScroll.smoothScrollBy(0, dp(70))
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT -> return true
+            KeyEvent.KEYCODE_STAR -> {
+                mt.star()
+                updateInput()
+                return true
+            }
+        }
+        if (mt.key(k)) {
+            updateInput()
+            return true
+        }
+        return false
+    }
+
+    private fun addConvo(label: String, text: String, color: Int) {
+        val start = convo.length
+        convo.append(label + ": ")
+        convo.setSpan(ForegroundColorSpan(color), start, convo.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        convo.append(text + "\n\n")
+        refreshConvo()
+    }
+
+    private fun refreshConvo() {
+        if (inputMode == InputMode.CHAT) convoText.text = convo
+        convoScroll.post { convoScroll.fullScroll(View.FOCUS_DOWN) }
+    }
+
+    // ---------- ChatGPT ----------
+
+    // The key can come from a file on the phone (openai_key.txt) or from what you typed in settings.
+    private fun readKey(): Pair<String, String>? {
+        var key = prefs.getString("openai_key", "") ?: ""
+        var model = prefs.getString("openai_model", "") ?: ""
+        try {
+            val f = File(getExternalFilesDir(null), "openai_key.txt")
+            if (f.exists()) {
+                val lines = f.readLines().map { it.replace("\uFEFF", "").trim() }.filter { it.isNotEmpty() }
+                if (lines.isNotEmpty()) key = lines[0]
+                if (lines.size > 1) model = lines[1]
+            }
+        } catch (e: Exception) { }
+        if (key.isEmpty()) return null
+        if (model.isEmpty()) model = aiModels[0]
+        return Pair(key, model)
+    }
+
+    private fun askAI(userText: String) {
+        val creds = readKey()
+        if (creds == null) {
+            addConvo("!", "No API key yet. FlipDeck settings > ChatGPT key.", Color.parseColor("#FF7043"))
+            return
+        }
+        val key = creds.first
+        val model = creds.second
+        history.add(Pair("user", userText))
+        busy = true
+        thinkingMark = convo.length
+        convo.append("...thinking\n\n")
+        refreshConvo()
+
+        val snapshot = history.takeLast(12).toList()
+        Thread {
+            var ok = false
+            val reply: String = try {
+                val conn = URL("https://api.openai.com/v1/chat/completions").openConnection() as HttpURLConnection
+                conn.requestMethod = "POST"
+                conn.connectTimeout = 15000
+                conn.readTimeout = 60000
+                conn.setRequestProperty("Content-Type", "application/json")
+                conn.setRequestProperty("Authorization", "Bearer $key")
+                conn.doOutput = true
+
+                val msgs = JSONArray()
+                msgs.put(
+                    JSONObject().put("role", "system").put(
+                        "content",
+                        "You are a helpful assistant on a small flip phone screen. Reply in plain text only, no markdown, and keep answers short (under 120 words) unless asked for more."
+                    )
+                )
+                for (m in snapshot) msgs.put(JSONObject().put("role", m.first).put("content", m.second))
+                val body = JSONObject().put("model", model).put("messages", msgs)
+                conn.outputStream.use { it.write(body.toString().toByteArray()) }
+
+                val code = conn.responseCode
+                val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                val raw = stream.bufferedReader().use { it.readText() }
+                if (code in 200..299) {
+                    ok = true
+                    JSONObject(raw).getJSONArray("choices").getJSONObject(0)
+                        .getJSONObject("message").getString("content").trim()
+                } else {
+                    val msg = try {
+                        JSONObject(raw).getJSONObject("error").getString("message")
+                    } catch (e: Exception) {
+                        raw.take(200)
+                    }
+                    "Error $code: $msg"
+                }
+            } catch (e: Exception) {
+                "Network problem: " + (e.message ?: e.javaClass.simpleName)
+            }
+            runOnUiThread {
+                if (thinkingMark >= 0 && thinkingMark <= convo.length) convo.delete(thinkingMark, convo.length)
+                busy = false
+                if (ok) {
+                    history.add(Pair("assistant", reply))
+                    addConvo("AI", reply, Color.parseColor("#FFB74D"))
+                } else {
+                    if (history.isNotEmpty()) history.removeAt(history.size - 1)
+                    addConvo("!", reply, Color.parseColor("#FF7043"))
+                }
+            }
+        }.start()
+    }
+
+    // ---------- browser ----------
+
+    private fun buildBrowserRows(): List<Row> {
+        val list = mutableListOf(
+            Row("Google", Color.parseColor("#4285F4"), emoji = "\uD83D\uDD0E",
+                onOpen = { openUrl("https://www.google.com") }),
+            Row("YouTube", Color.parseColor("#E53935"), emoji = "\u25B6\uFE0F",
+                onOpen = { openUrl("https://m.youtube.com") }),
+            Row("TikTok", Color.parseColor("#212121"), emoji = "\uD83C\uDFB5",
+                onOpen = { openUrl("https://www.tiktok.com") }),
+            Row("Instagram", Color.parseColor("#D81B60"), emoji = "\uD83D\uDCF7",
+                onOpen = { openUrl("https://www.instagram.com") }),
+            Row("Type address / search", Color.parseColor("#00897B"), emoji = "\u2328\uFE0F",
+                onOpen = { openEntry(InputMode.URL) })
+        )
+        if (webLayer != null) {
+            list.add(0, Row("Back to page", Color.parseColor("#7C4DFF"), emoji = "\u21A9\uFE0F",
+                onOpen = { setScreen(Screen.WEB) }))
+        }
+        return list
+    }
+
+    private fun parseAddress(t: String): String {
+        val s = t.trim()
+        return when {
+            s.startsWith("yt ", ignoreCase = true) ->
+                "https://m.youtube.com/results?search_query=" + Uri.encode(s.substring(3).trim())
+            s.startsWith("http://", ignoreCase = true) || s.startsWith("https://", ignoreCase = true) -> s
+            s.contains(".") && !s.contains(" ") -> "https://$s"
+            else -> "https://www.google.com/search?q=" + Uri.encode(s)
+        }
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun ensureWeb() {
+        if (webLayer != null) return
+        val layer = FrameLayout(this)
+        val wv = WebView(this)
+        wv.settings.javaScriptEnabled = true
+        wv.settings.domStorageEnabled = true
+        wv.settings.mediaPlaybackRequiresUserGesture = false
+        wv.settings.userAgentString = wv.settings.userAgentString.replace("; wv", "")
+        wv.webViewClient = WebViewClient()
+        wv.webChromeClient = WebChromeClient()
+        // Keys go to FlipDeck, which moves the cursor. The page itself gets taps from the cursor.
+        wv.isFocusable = false
+        wv.isFocusableInTouchMode = false
+
+        val cur = View(this)
+        cur.background = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(Color.argb(210, 255, 255, 255))
+            setStroke(dp(2), Color.BLACK)
+        }
+        layer.addView(wv, FrameLayout.LayoutParams(MP, MP))
+        layer.addView(cur, FrameLayout.LayoutParams(dp(16), dp(16)))
+        rootLayout.addView(layer, match())
+        webLayer = layer
+        webView = wv
+        cursorView = cur
+        layer.post {
+            cx = layer.width / 2f
+            cy = layer.height / 2f
+            positionCursor()
+        }
+    }
+
+    private fun openUrl(url: String) {
+        ensureWeb()
+        setScreen(Screen.WEB)
+        webView?.loadUrl(url)
+        toastLong("OK = click   * = scroll mode   0 = address   2/8 = page up/down   Back = back")
+    }
+
+    private fun positionCursor() {
+        val c = cursorView ?: return
+        c.translationX = cx - dp(8)
+        c.translationY = cy - dp(8)
+    }
+
+    private fun moveCursor(dx: Float, dy: Float) {
+        val wv = webView ?: return
+        if (scrollMode) {
+            wv.scrollBy((dx * 3).toInt(), (dy * 3).toInt())
+            return
+        }
+        val w = wv.width.toFloat()
+        val h = wv.height.toFloat()
+        val edge = dp(14).toFloat()
+        if (dy < 0 && cy <= edge) wv.scrollBy(0, (dy * 3).toInt())
+        else if (dy > 0 && cy >= h - edge) wv.scrollBy(0, (dy * 3).toInt())
+        cx = (cx + dx).coerceIn(0f, w)
+        cy = (cy + dy).coerceIn(0f, h)
+        positionCursor()
+    }
+
+    private fun webTap() {
+        val wv = webView ?: return
+        val t = SystemClock.uptimeMillis()
+        val down = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, cx, cy, 0)
+        wv.dispatchTouchEvent(down)
+        down.recycle()
+        ui.postDelayed({
+            val up = MotionEvent.obtain(t, SystemClock.uptimeMillis(), MotionEvent.ACTION_UP, cx, cy, 0)
+            wv.dispatchTouchEvent(up)
+            up.recycle()
+        }, 70)
+    }
+
+    private fun webKey(k: Int, e: KeyEvent?): Boolean {
+        val wv = webView ?: return false
+        val rep = e?.repeatCount ?: 0
+        val step = (dp(8) + minOf(rep, 10) * dp(3)).toFloat()
+        when (k) {
+            KeyEvent.KEYCODE_DPAD_UP -> { moveCursor(0f, -step); return true }
+            KeyEvent.KEYCODE_DPAD_DOWN -> { moveCursor(0f, step); return true }
+            KeyEvent.KEYCODE_DPAD_LEFT -> { moveCursor(-step, 0f); return true }
+            KeyEvent.KEYCODE_DPAD_RIGHT -> { moveCursor(step, 0f); return true }
+            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> { webTap(); return true }
+            KeyEvent.KEYCODE_BACK -> {
+                if (wv.canGoBack()) wv.goBack() else showBrowser()
+                return true
+            }
+            KeyEvent.KEYCODE_STAR -> {
+                scrollMode = !scrollMode
+                toast(if (scrollMode) "Scroll mode: arrows scroll the page" else "Cursor mode: arrows move the cursor")
+                return true
+            }
+            KeyEvent.KEYCODE_0 -> { openEntry(InputMode.URL); return true }
+            KeyEvent.KEYCODE_1 -> { showBrowser(); return true }
+            KeyEvent.KEYCODE_2 -> { wv.pageUp(false); return true }
+            KeyEvent.KEYCODE_8 -> { wv.pageDown(false); return true }
+            KeyEvent.KEYCODE_4 -> { if (wv.canGoBack()) wv.goBack(); return true }
+            KeyEvent.KEYCODE_6 -> { if (wv.canGoForward()) wv.goForward(); return true }
+            KeyEvent.KEYCODE_5 -> { wv.reload(); return true }
+        }
+        return false
+    }
+
     // ---------- phone check ----------
 
     private fun buildInfo(): String {
@@ -1057,14 +1625,22 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {
             "NOT FOUND"
         }
+        val keyState = if (readKey() != null) "found" else "missing"
+        val folder = try {
+            getExternalFilesDir(null)?.absolutePath ?: "?"
+        } catch (e: Exception) {
+            "?"
+        }
         return "PHONE CHECK\n\n" +
                 "Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")\n" +
                 "Model: " + Build.MODEL + "\n" +
                 "Web engine: " + web + "\n" +
                 "Flashlight: " + pm.hasSystemFeature(PackageManager.FEATURE_CAMERA_FLASH) + "\n" +
-                "Telephony: " + pm.hasSystemFeature(PackageManager.FEATURE_TELEPHONY) + "\n" +
                 "Wi-Fi: " + pm.hasSystemFeature(PackageManager.FEATURE_WIFI) + "\n" +
                 "Bluetooth: " + pm.hasSystemFeature(PackageManager.FEATURE_BLUETOOTH) + "\n\n" +
+                "ChatGPT key: " + keyState + "\n" +
+                "Key file goes in:\n" + folder + "\n" +
+                "named openai_key.txt\n\n" +
                 "Back = return"
     }
 
@@ -1072,10 +1648,11 @@ class MainActivity : AppCompatActivity() {
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         val testing = screen == Screen.TEXT && textMode == TextMode.KEYTEST
-        if (!testing && (keyCode == KEY_FAVORITE || keyCode == KEY_SIDE)) {
+        val typing = screen == Screen.INPUT
+        if (!testing && !typing && (keyCode == KEY_FAVORITE || keyCode == KEY_SIDE)) {
             if (event == null || event.repeatCount == 0) {
                 val id = if (keyCode == KEY_FAVORITE)
-                    prefs.getString("fav", "contacts") else prefs.getString("side", "quick")
+                    prefs.getString("fav", "contacts") else prefs.getString("side", "chat")
                 runAction(id ?: "apps")
             }
             return true
@@ -1085,6 +1662,8 @@ class MainActivity : AppCompatActivity() {
             Screen.LIST -> listKey(keyCode)
             Screen.TEXT -> textKey(keyCode)
             Screen.PHOTO -> photoKey(keyCode)
+            Screen.INPUT -> inputKey(keyCode)
+            Screen.WEB -> webKey(keyCode, event)
         }
         return handled || super.onKeyDown(keyCode, event)
     }

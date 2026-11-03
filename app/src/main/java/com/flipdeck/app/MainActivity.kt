@@ -2,7 +2,7 @@ package com.flipdeck.app
 
 import android.Manifest
 import android.annotation.SuppressLint
-import android.app.RoleManager
+import android.app.role.RoleManager
 import android.content.ActivityNotFoundException
 import android.content.BroadcastReceiver
 import android.content.ContentUris

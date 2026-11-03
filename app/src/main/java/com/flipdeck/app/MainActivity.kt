@@ -63,6 +63,7 @@ import androidx.recyclerview.widget.LinearSmoothScroller
 import androidx.recyclerview.widget.RecyclerView
 import org.json.JSONArray
 import org.json.JSONObject
+import org.json.JSONTokener
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
@@ -88,7 +89,7 @@ class ActionOpt(val id: String, val label: String)
 enum class Screen { HOME, LIST, TEXT, PHOTO, INPUT, WEB }
 enum class ListMode { APPS, SETTINGS, QUICK, BROWSER }
 enum class TextMode { KEYTEST, INFO }
-enum class InputMode { CHAT, KEY, URL }
+enum class InputMode { CHAT, KEY, URL, WEB }
 
 // Types text with the number keys, like old phones: press 2 once = a, twice = b, three times = c.
 class MultiTap {
@@ -226,6 +227,8 @@ class MainActivity : AppCompatActivity() {
     private val convo = SpannableStringBuilder()
     private val history = mutableListOf<Pair<String, String>>()
     private var busy = false
+    private var inputMask = false
+    private var webInitial = ""
     private var thinkingMark = -1
 
     private var rows: List<Row> = emptyList()
@@ -1288,13 +1291,19 @@ class MainActivity : AppCompatActivity() {
     // ---------- typing screen (ChatGPT, API key, web address) ----------
 
     private fun updateInput() {
-        inputBox.text = mt.text() + "\u258C"
-        inputHint.text = (if (inputMode == InputMode.CHAT) "OK send" else "OK done") +
-                "   Back delete   * " + mt.caseLabel() + "   0 space"
+        val shown = if (inputMask) "\u2022".repeat(mt.text().length) else mt.text()
+        inputBox.text = shown + "\u258C"
+        val ok = when (inputMode) {
+            InputMode.CHAT -> "OK send"
+            InputMode.WEB -> "OK done   Call search"
+            else -> "OK done"
+        }
+        inputHint.text = ok + "   Back delete   * " + mt.caseLabel() + "   0 space"
     }
 
     private fun openChat() {
         inputMode = InputMode.CHAT
+        inputMask = false
         mt.caseMode = 0
         inputTitle.text = "ChatGPT"
         if (convo.isEmpty()) {
@@ -1309,6 +1318,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun openEntry(mode: InputMode) {
         inputMode = mode
+        inputMask = false
         mt.clear()
         mt.caseMode = 1
         when (mode) {
@@ -1332,6 +1342,7 @@ class MainActivity : AppCompatActivity() {
             InputMode.CHAT -> showHome()
             InputMode.KEY -> showSettings()
             InputMode.URL -> if (webLayer != null) setScreen(Screen.WEB) else showBrowser()
+            InputMode.WEB -> setScreen(Screen.WEB)
         }
     }
 
@@ -1358,6 +1369,10 @@ class MainActivity : AppCompatActivity() {
                 if (text.isEmpty()) return
                 openUrl(parseAddress(text))
             }
+            InputMode.WEB -> {
+                insertIntoPage(mt.text(), false)
+                setScreen(Screen.WEB)
+            }
         }
     }
 
@@ -1368,6 +1383,10 @@ class MainActivity : AppCompatActivity() {
                 return true
             }
             KeyEvent.KEYCODE_BACK -> {
+                if (inputMode == InputMode.WEB && mt.text() == webInitial) {
+                    leaveInput() // nothing changed yet: Back cancels
+                    return true
+                }
                 if (!mt.backspace()) leaveInput()
                 updateInput()
                 return true
@@ -1386,6 +1405,13 @@ class MainActivity : AppCompatActivity() {
                 return true
             }
             KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT -> return true
+            KeyEvent.KEYCODE_CALL -> {
+                if (inputMode == InputMode.WEB) {
+                    insertIntoPage(mt.text(), true)
+                    setScreen(Screen.WEB)
+                }
+                return true
+            }
             KeyEvent.KEYCODE_STAR -> {
                 mt.star()
                 updateInput()
@@ -1571,7 +1597,7 @@ class MainActivity : AppCompatActivity() {
         ensureWeb()
         setScreen(Screen.WEB)
         webView?.loadUrl(url)
-        toastLong("OK = click   * = scroll mode   0 = address   2/8 = page up/down   Back = back")
+        toastLong("OK = click (a text box opens typing)   * = scroll mode   0 = address   2/8 = page up/down")
     }
 
     private fun positionCursor() {
@@ -1607,6 +1633,62 @@ class MainActivity : AppCompatActivity() {
             wv.dispatchTouchEvent(up)
             up.recycle()
         }, 70)
+        // If the tap landed in a text box, open the typing screen for it.
+        ui.postDelayed({ checkEditable() }, 450)
+    }
+
+    // Looks at the page: is a text box selected? If so, open the typing screen for it.
+    private fun checkEditable() {
+        val wv = webView ?: return
+        if (screen != Screen.WEB) return
+        val js = "(function(){var e=document.activeElement;if(!e)return '';" +
+                "var t=(e.tagName||'').toUpperCase();var ty=(e.type||'').toLowerCase();" +
+                "var ok=(t==='INPUT'&&['text','search','email','url','tel','password','number',''].indexOf(ty)>=0)" +
+                "||t==='TEXTAREA'||e.isContentEditable;if(!ok)return '';" +
+                "return JSON.stringify({v:((e.value!==undefined&&e.value!==null)?e.value:e.innerText)||'',p:ty==='password'});})()"
+        wv.evaluateJavascript(js) { raw ->
+            try {
+                val inner = JSONTokener(raw ?: "").nextValue()
+                if (inner is String && inner.isNotEmpty() && screen == Screen.WEB) {
+                    val o = JSONObject(inner)
+                    openWebText(o.optString("v", ""), o.optBoolean("p", false))
+                }
+            } catch (e: Exception) { }
+        }
+    }
+
+    private fun openWebText(initial: String, password: Boolean) {
+        inputMode = InputMode.WEB
+        inputMask = password
+        mt.clear()
+        mt.caseMode = 1
+        mt.sb.append(initial)
+        webInitial = initial
+        inputTitle.text = if (password) "Type password" else "Type in the page"
+        convoText.text = "Typing into the box you clicked.\n\nOK = put the text in the box\nCall = put it in and press search/Enter\nBack = cancel (or delete once you type)"
+        updateInput()
+        setScreen(Screen.INPUT)
+        convoScroll.post { convoScroll.fullScroll(View.FOCUS_UP) }
+    }
+
+    // Writes the typed text into the selected text box on the page (and presses Enter if asked).
+    private fun insertIntoPage(text: String, submit: Boolean) {
+        val wv = webView ?: return
+        val js = "(function(t,submit){var e=document.activeElement;if(!e)return;" +
+                "var tag=(e.tagName||'').toUpperCase();" +
+                "if(tag==='INPUT'||tag==='TEXTAREA'){" +
+                "var proto=(tag==='INPUT')?HTMLInputElement.prototype:HTMLTextAreaElement.prototype;" +
+                "var d=Object.getOwnPropertyDescriptor(proto,'value');d.set.call(e,t);" +
+                "e.dispatchEvent(new Event('input',{bubbles:true}));" +
+                "e.dispatchEvent(new Event('change',{bubbles:true}));}" +
+                "else if(e.isContentEditable){e.innerText=t;e.dispatchEvent(new Event('input',{bubbles:true}));}" +
+                "if(submit){var o={key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true};" +
+                "e.dispatchEvent(new KeyboardEvent('keydown',o));" +
+                "e.dispatchEvent(new KeyboardEvent('keypress',o));" +
+                "e.dispatchEvent(new KeyboardEvent('keyup',o));" +
+                "if(e.form){if(e.form.requestSubmit){e.form.requestSubmit();}else{e.form.submit();}}}" +
+                "})(" + JSONObject.quote(text) + "," + submit + ")"
+        wv.evaluateJavascript(js, null)
     }
 
     private fun webKey(k: Int, e: KeyEvent?): Boolean {
@@ -1629,6 +1711,7 @@ class MainActivity : AppCompatActivity() {
                 return true
             }
             KeyEvent.KEYCODE_0 -> { openEntry(InputMode.URL); return true }
+            KeyEvent.KEYCODE_7 -> { checkEditable(); return true }
             KeyEvent.KEYCODE_1 -> { showBrowser(); return true }
             KeyEvent.KEYCODE_2 -> { wv.pageUp(false); return true }
             KeyEvent.KEYCODE_8 -> { wv.pageDown(false); return true }
